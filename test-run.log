@@ -1,0 +1,48 @@
+## Environment
+go version go1.23.4 linux/amd64
+UTC 2026-11-25T20:19:35Z
+
+## $ gofmt -l .
+(all Go files formatted)
+
+## $ go test -count=1 -v ./...
+?   	gsb/batch49-go-safety-d-09	[no test files]
+=== RUN   TestAddAccessRejectsBlankFields
+--- PASS: TestAddAccessRejectsBlankFields (0.00s)
+=== RUN   TestAddAccessEnforcesTraceLimit
+--- PASS: TestAddAccessEnforcesTraceLimit (0.00s)
+=== RUN   TestSolveMapsReadAndWriteToCaps
+--- PASS: TestSolveMapsReadAndWriteToCaps (0.00s)
+=== RUN   TestSolveGroupsPathsPerCapability
+--- PASS: TestSolveGroupsPathsPerCapability (0.00s)
+=== RUN   TestSolveIsRepeatable
+--- PASS: TestSolveIsRepeatable (0.00s)
+=== RUN   TestUncoveredAccessInvalidatesDemand
+--- PASS: TestUncoveredAccessInvalidatesDemand (0.00s)
+=== RUN   TestStatNeedsItsOwnCapability
+--- PASS: TestStatNeedsItsOwnCapability (0.00s)
+=== RUN   TestChmodChownExecAreDistinctCaps
+--- PASS: TestChmodChownExecAreDistinctCaps (0.00s)
+=== RUN   TestDiffReportsMissingAndExtra
+--- PASS: TestDiffReportsMissingAndExtra (0.00s)
+=== RUN   TestDiffDedupesAndSortsCurrent
+--- PASS: TestDiffDedupesAndSortsCurrent (0.00s)
+=== RUN   TestExplainReturnsAccessesInInsertionOrder
+--- PASS: TestExplainReturnsAccessesInInsertionOrder (0.00s)
+=== RUN   TestExplainUnknownCapabilityIsEmpty
+--- PASS: TestExplainUnknownCapabilityIsEmpty (0.00s)
+=== RUN   TestSnapshotRestoreKeepsTrace
+--- PASS: TestSnapshotRestoreKeepsTrace (0.00s)
+=== RUN   TestCountAccessesAndReset
+--- PASS: TestCountAccessesAndReset (0.00s)
+=== RUN   TestConcurrentAddAndSolveStayConsistent
+--- PASS: TestConcurrentAddAndSolveStayConsistent (0.00s)
+PASS
+ok  	gsb/batch49-go-safety-d-09/tests	0.003s
+
+## $ go test -race -count=1 ./...
+?   	gsb/batch49-go-safety-d-09	[no test files]
+ok  	gsb/batch49-go-safety-d-09/tests	1.012s
+
+## $ go vet ./...
+vet: OK
