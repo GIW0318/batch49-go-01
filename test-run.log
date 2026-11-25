@@ -1,0 +1,61 @@
+MediaClockSlave verification — 2026-11-26 05:37:49 CST
+host: Linux 6.18.33.2-microsoft-standard-WSL2 x86_64
+go: go version go1.23.4 linux/amd64
+
+$ gofmt -l .
+(empty above = all formatted)
+
+$ go vet ./...
+vet: OK
+
+$ go test -v -count=1 ./...
+?   	gsb/batch49-go-game-c-13	[no test files]
+=== RUN   TestFreshClockHasNoOffset
+--- PASS: TestFreshClockHasNoOffset (0.00s)
+=== RUN   TestFirstSampleSetsOffsetDirectly
+--- PASS: TestFirstSampleSetsOffsetDirectly (0.00s)
+=== RUN   TestPushSampleRejectsBadMeasurement
+--- PASS: TestPushSampleRejectsBadMeasurement (0.00s)
+=== RUN   TestRTTMedianOutlierIsRejected
+--- PASS: TestRTTMedianOutlierIsRejected (0.00s)
+=== RUN   TestOffsetWindowUsesMedian
+--- PASS: TestOffsetWindowUsesMedian (0.00s)
+=== RUN   TestSmallOffsetSlewsWithinLimit
+--- PASS: TestSmallOffsetSlewsWithinLimit (0.00s)
+=== RUN   TestLargeOffsetStepsForward
+--- PASS: TestLargeOffsetStepsForward (0.00s)
+=== RUN   TestBackwardCorrectionNeverRewindsTimeline
+--- PASS: TestBackwardCorrectionNeverRewindsTimeline (0.00s)
+=== RUN   TestSetSlewLimitBoundsAndClamps
+--- PASS: TestSetSlewLimitBoundsAndClamps (0.00s)
+=== RUN   TestHoldoverAfterSilence
+--- PASS: TestHoldoverAfterSilence (0.00s)
+=== RUN   TestSampleEndsHoldover
+--- PASS: TestSampleEndsHoldover (0.00s)
+=== RUN   TestAdvanceRejectsNonPositive
+--- PASS: TestAdvanceRejectsNonPositive (0.00s)
+=== RUN   TestSnapshotRestoreServoState
+--- PASS: TestSnapshotRestoreServoState (0.00s)
+=== RUN   TestRestoreRejectsCorruptSnapshot
+--- PASS: TestRestoreRejectsCorruptSnapshot (0.00s)
+=== RUN   TestConcurrentAdvanceAndReaders
+--- PASS: TestConcurrentAdvanceAndReaders (0.00s)
+PASS
+ok  	gsb/batch49-go-game-c-13/tests	0.003s
+
+$ go test -race -count=1 ./...
+?   	gsb/batch49-go-game-c-13	[no test files]
+ok  	gsb/batch49-go-game-c-13/tests	1.016s
+
+$ go test -count=10 ./tests
+ok  	gsb/batch49-go-game-c-13/tests	0.009s
+
+## Extra stability/self-verification
+$ go test -race -run TestConcurrentAdvanceAndReaders -count=10 ./tests
+ok  	gsb/batch49-go-game-c-13/tests	1.037s
+$ go test -count=20 ./tests
+ok  	gsb/batch49-go-game-c-13/tests	0.012s
+$ go test ./...   (final acceptance command)
+?   	gsb/batch49-go-game-c-13	[no test files]
+ok  	gsb/batch49-go-game-c-13/tests	(cached)
+final_exit=0
