@@ -1,0 +1,55 @@
+# SSO implementation test record
+date: 2026-11-25T17:22:47Z
+go: go version go1.23.4 linux/amd64
+
+$ go test -count=1 -v ./...
+?   	gsb/batch49-go-safety-a-23	[no test files]
+=== RUN   TestCreateStartsInDraft
+--- PASS: TestCreateStartsInDraft (0.00s)
+=== RUN   TestCreateRejectsBlankTenant
+--- PASS: TestCreateRejectsBlankTenant (0.00s)
+=== RUN   TestCreateEnforcesConnectionLimit
+--- PASS: TestCreateEnforcesConnectionLimit (0.00s)
+=== RUN   TestVerifyDomainMarksVerified
+--- PASS: TestVerifyDomainMarksVerified (0.00s)
+=== RUN   TestVerifyDomainRejectsBadProof
+--- PASS: TestVerifyDomainRejectsBadProof (0.00s)
+=== RUN   TestConnectivityTestMovesToTested
+--- PASS: TestConnectivityTestMovesToTested (0.00s)
+=== RUN   TestEnableAfterTested
+--- PASS: TestEnableAfterTested (0.00s)
+=== RUN   TestDisableFromEnabled
+--- PASS: TestDisableFromEnabled (0.00s)
+=== RUN   TestRolloutPercentBounds
+--- PASS: TestRolloutPercentBounds (0.00s)
+=== RUN   TestRolloutPersistsPercent
+--- PASS: TestRolloutPersistsPercent (0.00s)
+=== RUN   TestSnapshotRestoreKeepsEnabledAndRollout
+--- PASS: TestSnapshotRestoreKeepsEnabledAndRollout (0.00s)
+=== RUN   TestRestoreRejectsCorruptSnapshot
+--- PASS: TestRestoreRejectsCorruptSnapshot (0.00s)
+=== RUN   TestUnknownConnectionRejected
+--- PASS: TestUnknownConnectionRejected (0.00s)
+=== RUN   TestCreateRejectsDuplicateDomain
+--- PASS: TestCreateRejectsDuplicateDomain (0.00s)
+=== RUN   TestRouteLoginUsesVerifiedDomain
+--- PASS: TestRouteLoginUsesVerifiedDomain (0.00s)
+PASS
+ok  	gsb/batch49-go-safety-a-23/tests	0.004s
+
+$ go test -race -count=1 ./...
+?   	gsb/batch49-go-safety-a-23	[no test files]
+ok  	gsb/batch49-go-safety-a-23/tests	1.014s
+
+$ go vet ./...
+vet: OK
+
+# Ephemeral fallback/restart/concurrency race check
+# Command: go test -race -run TestFinalCheck -v .
+# Temporary zz_final_check_test.go was removed after the run to preserve the 15-case acceptance suite.
+=== RUN   TestFinalCheckFallbackRestoreAndEnforce
+--- PASS: TestFinalCheckFallbackRestoreAndEnforce (0.00s)
+=== RUN   TestFinalCheckConcurrency
+--- PASS: TestFinalCheckConcurrency (0.00s)
+PASS
+ok  	gsb/batch49-go-safety-a-23	1.013s
