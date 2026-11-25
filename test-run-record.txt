@@ -1,0 +1,80 @@
+SCIM group graph sync - test run record
+Date: 2026-11-26 00:20:58 CST
+Host: Linux x86_64
+Go: go version go1.23.4 linux/amd64
+================================================================
+$ gofmt -l .   (empty below means all formatted)
+----------------------------------------------------------------
+$ go vet ./... && go build ./...
+vet/build: OK
+================================================================
+$ go test -count=1 -v ./...
+?   	gsb/batch49-go-safety-a-03	[no test files]
+=== RUN   TestUpsertGroupValidatesIdentity
+--- PASS: TestUpsertGroupValidatesIdentity (0.00s)
+=== RUN   TestUpsertGroupCreatesThenUpdates
+--- PASS: TestUpsertGroupCreatesThenUpdates (0.00s)
+=== RUN   TestGroupLimitPerTenant
+--- PASS: TestGroupLimitPerTenant (0.00s)
+=== RUN   TestSetMembersComputesDiff
+--- PASS: TestSetMembersComputesDiff (0.00s)
+=== RUN   TestSetMembersRejectsOverCapWithoutPartialWrite
+--- PASS: TestSetMembersRejectsOverCapWithoutPartialWrite (0.00s)
+=== RUN   TestAddMemberValidation
+--- PASS: TestAddMemberValidation (0.00s)
+=== RUN   TestRemoveMemberMissing
+--- PASS: TestRemoveMemberMissing (0.00s)
+=== RUN   TestCycleRejected
+--- PASS: TestCycleRejected (0.00s)
+=== RUN   TestDepthLimitRejected
+--- PASS: TestDepthLimitRejected (0.00s)
+=== RUN   TestDeleteGroupUnlinksReferences
+--- PASS: TestDeleteGroupUnlinksReferences (0.00s)
+=== RUN   TestEffectiveMembersExpandsNesting
+--- PASS: TestEffectiveMembersExpandsNesting (0.00s)
+=== RUN   TestTenantIsolation
+--- PASS: TestTenantIsolation (0.00s)
+=== RUN   TestMembersOrderedByTypeThenID
+--- PASS: TestMembersOrderedByTypeThenID (0.00s)
+=== RUN   TestSnapshotRestoreKeepsGraph
+--- PASS: TestSnapshotRestoreKeepsGraph (0.00s)
+=== RUN   TestConcurrentAddMemberKeepsAllRefs
+--- PASS: TestConcurrentAddMemberKeepsAllRefs (0.00s)
+PASS
+ok  	gsb/batch49-go-safety-a-03/tests	0.003s
+================================================================
+Acceptance result: PASS=15 (want 15), FAIL=0
+================================================================
+$ go test -race -count=3 ./...
+?   	gsb/batch49-go-safety-a-03	[no test files]
+ok  	gsb/batch49-go-safety-a-03/tests	1.019s
+----------------------------------------------------------------
+$ go test -race -run TestConcurrentAddMemberKeepsAllRefs -count=50 ./tests/
+ok  	gsb/batch49-go-safety-a-03/tests	1.045s
+----------------------------------------------------------------
+$ go test -count=10 ./...
+?   	gsb/batch49-go-safety-a-03	[no test files]
+ok  	gsb/batch49-go-safety-a-03/tests	0.008s
+================================================================
+Additional local self-verification (temporary -race test covering
+cap-boundary races, same-ref race, group-limit race, concurrent
+readers, watermarks, delete frees quota, atomic cycle/depth reject,
+parent delete inheritance, diamond dedup, snapshot restart equivalence,
+whole-store replace, corrupt snapshots, missing lookups, ref parsing;
+file removed before delivery):
+  --- PASS: TestZZConcurrentAddCapBoundary (0.00s)
+  --- PASS: TestZZConcurrentSameRef (0.00s)
+  --- PASS: TestZZConcurrentUpsertLimit (0.00s)
+  --- PASS: TestZZConcurrentReaders (0.04s)
+  --- PASS: TestZZReUpsertPreservesMembersAndWatermark (0.00s)
+  --- PASS: TestZZGroupLimitFreesOnDelete (0.00s)
+  --- PASS: TestZZAddMemberCapBoundary (0.00s)
+  --- PASS: TestZZSetMembersRejectsBadAndDangling (0.00s)
+  --- PASS: TestZZSetMembersCycleAndDepthAtomic (0.00s)
+  --- PASS: TestZZDeleteParentKeepsChildrenAndStopsInheritance (0.00s)
+  --- PASS: TestZZDiamondEffectiveDedup (0.00s)
+  --- PASS: TestZZSnapshotRestartEquivalence (0.00s)
+  --- PASS: TestZZRestoreReplacesWholeStore (0.00s)
+  --- PASS: TestZZMissingLookups (0.00s)
+  --- PASS: TestZZParseRefEdges (0.00s)
+  ZZ self-check: PASS=15 FAIL=0
