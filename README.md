@@ -20,3 +20,12 @@ go test ./...
 - 实现文件：`broadphase_hash_grid.go`
 - 包名：`task`；测试目录 `tests/` 同样声明 `package task`，通过导入路径引用本模块
 - 主要类型：`HashGrid`
+
+## 格子容量口径
+
+- 对象上限：每张网格最多 `MaxObjects = 4096` 个对象，达到上限后 `Insert` 返回 `ErrTooManyObjects`。
+- 跨格上限：单个包围盒最多覆盖 `MaxCellsPerBox = 65536` 个格子，超过上限返回 `ErrTooManyCells`，不会裁剪。
+- 格子坐标：按世界坐标取 `floor(coord / cellSize)`，包围盒的 `Min` 与 `Max` 两端格子都计入，因此格子区间是闭区间。
+- 溢出判定：包围盒在三个轴上都完全落在 `[bounds.Min, bounds.Max]` 内才进入正常格；任一轴越界则整对象进入溢出桶，不做部分格登记。
+- 预算口径：`Pairs` / `Query` 的第二返回值是“尚未返回的唯一候选数”，已返回的候选不计入，跨格重复候选只计一次。
+- 快照口径：快照包含 `cellSize`、边界、盒子表、正常格映射与溢出桶；恢复会先完整校验和构建临时状态，成功后才原子替换现有状态。
