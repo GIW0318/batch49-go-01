@@ -3,12 +3,36 @@
 package task
 
 import (
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"os"
+	"sort"
+	"strings"
+	"sync"
 	"time"
 )
 
 // errNotImplemented is returned by behaviour that still needs work.
 var errNotImplemented = errors.New("not implemented")
+
+// legacyModeEnv disables all added stateful behaviour and restores the original
+// stub surface. It is an operational kill switch used for byte-for-byte
+// before/after output checks.
+const legacyModeEnv = "GSB_SERVICE_ACCOUNT_ISSUER_LEGACY"
+
+func legacyModeEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(legacyModeEnv))) {
+	case "1", "t", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
 
 // Request states.
 const (
@@ -103,68 +127,702 @@ type Options struct {
 	Now                func() time.Time
 }
 
+// keyRecord is the persisted key state. It deliberately has no plaintext field:
+// the secret is returned exactly once and only its prefix is retained.
+type keyRecord struct {
+	KeyID         string    `json:"key_id"`
+	RequestID     string    `json:"request_id"`
+	AccountID     string    `json:"account_id"`
+	Prefix        string    `json:"prefix"`
+	Scopes        []string  `json:"scopes"`
+	State         string    `json:"state"`
+	IssuedAt      time.Time `json:"issued_at"`
+	ActivateAt    time.Time `json:"activate_at"`
+	ExpiresAt     time.Time `json:"expires_at"`
+	Seq           int64     `json:"seq"`
+	DisableReason string    `json:"disable_reason,omitempty"`
+}
+
 // ServiceAccountKeyIssuer owns the request table, the key table and the
-// monotonic counters.
+// monotonic counters. All check-then-act operations are serialized by mu.
 type ServiceAccountKeyIssuer struct {
-	opts Options
+	opts   Options
+	legacy bool
+
+	mu                sync.Mutex
+	requests          map[string]*Request
+	keys              map[string]*keyRecord
+	pendingByAccount  map[string]int
+	keyCountByAccount map[string]int
+	reqSeq            int64
+	keySeq            int64
 }
 
 // NewServiceAccountKeyIssuer builds an issuer with the given options.
 func NewServiceAccountKeyIssuer(opts Options) *ServiceAccountKeyIssuer {
-	return &ServiceAccountKeyIssuer{opts: opts}
+	issuer := &ServiceAccountKeyIssuer{opts: opts}
+	if legacyModeEnabled() {
+		issuer.legacy = true
+		return issuer
+	}
+	if opts.Now == nil {
+		opts.Now = time.Now
+	}
+	if opts.RequiredApprovals <= 0 {
+		opts.RequiredApprovals = 1
+	}
+	issuer.opts = opts
+	issuer.requests = make(map[string]*Request)
+	issuer.keys = make(map[string]*keyRecord)
+	issuer.pendingByAccount = make(map[string]int)
+	issuer.keyCountByAccount = make(map[string]int)
+	return issuer
+}
+
+func (i *ServiceAccountKeyIssuer) now() time.Time {
+	return i.opts.Now()
+}
+
+func isBlank(value string) bool {
+	return strings.TrimSpace(value) == ""
+}
+
+func cloneStrings(values []string) []string {
+	if values == nil {
+		return nil
+	}
+	cloned := make([]string, len(values))
+	copy(cloned, values)
+	return cloned
+}
+
+func cloneRequest(req *Request) Request {
+	cloned := *req
+	cloned.Approvals = cloneStrings(req.Approvals)
+	cloned.Spec.Scopes = cloneStrings(req.Spec.Scopes)
+	return cloned
+}
+
+func toKeyMeta(rec *keyRecord) KeyMeta {
+	return KeyMeta{
+		KeyID:      rec.KeyID,
+		AccountID:  rec.AccountID,
+		Prefix:     rec.Prefix,
+		Scopes:     cloneStrings(rec.Scopes),
+		State:      rec.State,
+		ActivateAt: rec.ActivateAt,
+		ExpiresAt:  rec.ExpiresAt,
+		Seq:        rec.Seq,
+	}
+}
+
+func requiredVotes(req *Request, fallback int) int {
+	if req.Required > 0 {
+		return req.Required
+	}
+	if fallback > 0 {
+		return fallback
+	}
+	return 1
+}
+
+// expireIfDueLocked performs lazy automatic expiry. Explicit disable is sticky
+// and is never rewritten by the clock. Caller must hold i.mu.
+func (i *ServiceAccountKeyIssuer) expireIfDueLocked(rec *keyRecord) {
+	if rec.State != KeyPendingActivation && rec.State != KeyActive {
+		return
+	}
+	if !i.now().Before(rec.ExpiresAt) {
+		rec.State = KeyExpired
+	}
 }
 
 // Request opens a key ticket for an account.
 func (i *ServiceAccountKeyIssuer) Request(accountID, requesterID string, spec KeySpec) (Request, error) {
-	return Request{}, errNotImplemented
+	if i.legacy {
+		return Request{}, errNotImplemented
+	}
+
+	accountID = strings.TrimSpace(accountID)
+	requesterID = strings.TrimSpace(requesterID)
+	if accountID == "" || requesterID == "" {
+		return Request{}, ErrBlankID
+	}
+	if isBlank(spec.Name) {
+		return Request{}, ErrBadSpec
+	}
+	if len(spec.Scopes) == 0 {
+		return Request{}, ErrBadSpec
+	}
+	for _, scope := range spec.Scopes {
+		if isBlank(scope) {
+			return Request{}, ErrBadSpec
+		}
+	}
+	if spec.TTL <= 0 {
+		return Request{}, ErrBadSpec
+	}
+	if spec.TTL > i.opts.MaxTTL {
+		return Request{}, ErrTTLTooLong
+	}
+
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	if i.opts.MaxPendingRequests > 0 && i.pendingByAccount[accountID] >= i.opts.MaxPendingRequests {
+		return Request{}, ErrRequestLimit
+	}
+
+	i.reqSeq++
+	requestID := fmt.Sprintf("req-%d", i.reqSeq)
+	req := &Request{
+		ID:          requestID,
+		AccountID:   accountID,
+		RequesterID: requesterID,
+		Spec: KeySpec{
+			Name:   strings.TrimSpace(spec.Name),
+			Scopes: cloneStrings(spec.Scopes),
+			TTL:    spec.TTL,
+		},
+		Approvals: []string{},
+		Required:  i.opts.RequiredApprovals,
+		State:     RequestPending,
+		Seq:       i.reqSeq,
+	}
+	i.requests[requestID] = req
+	i.pendingByAccount[accountID]++
+	return cloneRequest(req), nil
 }
 
 // Approve records one reviewer vote and closes the quorum when reached.
 func (i *ServiceAccountKeyIssuer) Approve(requestID, approverID string) (Request, error) {
-	return Request{}, errNotImplemented
+	if i.legacy {
+		return Request{}, errNotImplemented
+	}
+
+	requestID = strings.TrimSpace(requestID)
+	approverID = strings.TrimSpace(approverID)
+	if requestID == "" || approverID == "" {
+		return Request{}, ErrBlankID
+	}
+
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	req, ok := i.requests[requestID]
+	if !ok {
+		return Request{}, ErrRequestNotFound
+	}
+	if approverID == req.RequesterID {
+		return cloneRequest(req), ErrSelfApproval
+	}
+	if req.State != RequestPending {
+		return cloneRequest(req), ErrRequestClosed
+	}
+
+	for _, existing := range req.Approvals {
+		if existing == approverID {
+			return cloneRequest(req), nil
+		}
+	}
+
+	req.Approvals = append(req.Approvals, approverID)
+	if len(req.Approvals) >= requiredVotes(req, i.opts.RequiredApprovals) {
+		req.State = RequestApproved
+		i.pendingByAccount[req.AccountID]--
+		if i.pendingByAccount[req.AccountID] <= 0 {
+			delete(i.pendingByAccount, req.AccountID)
+		}
+	}
+	return cloneRequest(req), nil
 }
 
 // Reject terminates a ticket without issuing anything.
 func (i *ServiceAccountKeyIssuer) Reject(requestID, approverID, reason string) (Request, error) {
-	return Request{}, errNotImplemented
+	if i.legacy {
+		return Request{}, errNotImplemented
+	}
+
+	requestID = strings.TrimSpace(requestID)
+	approverID = strings.TrimSpace(approverID)
+	if requestID == "" || approverID == "" {
+		return Request{}, ErrBlankID
+	}
+
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	req, ok := i.requests[requestID]
+	if !ok {
+		return Request{}, ErrRequestNotFound
+	}
+	if approverID == req.RequesterID {
+		return cloneRequest(req), ErrSelfApproval
+	}
+	if req.State != RequestPending {
+		return cloneRequest(req), ErrRequestClosed
+	}
+
+	req.State = RequestRejected
+	req.RejectReason = strings.TrimSpace(reason)
+	i.pendingByAccount[req.AccountID]--
+	if i.pendingByAccount[req.AccountID] <= 0 {
+		delete(i.pendingByAccount, req.AccountID)
+	}
+	return cloneRequest(req), nil
 }
 
 // Issue turns an approved ticket into a key and returns the plaintext once.
 func (i *ServiceAccountKeyIssuer) Issue(requestID string) (IssuedKey, error) {
-	return IssuedKey{}, errNotImplemented
+	if i.legacy {
+		return IssuedKey{}, errNotImplemented
+	}
+
+	requestID = strings.TrimSpace(requestID)
+	if requestID == "" {
+		return IssuedKey{}, ErrBlankID
+	}
+
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	req, ok := i.requests[requestID]
+	if !ok {
+		return IssuedKey{}, ErrRequestNotFound
+	}
+	if req.State == RequestIssued {
+		return IssuedKey{}, ErrAlreadyIssued
+	}
+	if req.State == RequestRejected {
+		return IssuedKey{}, ErrRequestClosed
+	}
+	if req.State != RequestApproved {
+		return IssuedKey{}, ErrNotApproved
+	}
+
+	if i.opts.MaxKeysPerAccount > 0 && i.keyCountByAccount[req.AccountID] >= i.opts.MaxKeysPerAccount {
+		return IssuedKey{}, ErrKeyLimit
+	}
+
+	plaintext, err := generatePlaintext()
+	if err != nil {
+		return IssuedKey{}, err
+	}
+
+	issuedAt := i.now()
+	i.keySeq++
+	keyID := fmt.Sprintf("key-%d", i.keySeq)
+	rec := &keyRecord{
+		KeyID:      keyID,
+		RequestID:  req.ID,
+		AccountID:  req.AccountID,
+		Prefix:     plaintext[:8],
+		Scopes:     cloneStrings(req.Spec.Scopes),
+		State:      KeyPendingActivation,
+		IssuedAt:   issuedAt,
+		ActivateAt: issuedAt.Add(i.opts.ActivationDelay),
+		ExpiresAt:  issuedAt.Add(req.Spec.TTL),
+		Seq:        i.keySeq,
+	}
+	i.keys[keyID] = rec
+	i.keyCountByAccount[req.AccountID]++
+	req.State = RequestIssued
+
+	return IssuedKey{
+		KeyID:      rec.KeyID,
+		RequestID:  rec.RequestID,
+		AccountID:  rec.AccountID,
+		Plaintext:  plaintext,
+		Prefix:     rec.Prefix,
+		Scopes:     cloneStrings(rec.Scopes),
+		State:      rec.State,
+		IssuedAt:   rec.IssuedAt,
+		ActivateAt: rec.ActivateAt,
+		ExpiresAt:  rec.ExpiresAt,
+		Seq:        rec.Seq,
+	}, nil
+}
+
+func generatePlaintext() (string, error) {
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(raw), nil
 }
 
 // Activate enables a key once its activation delay has elapsed.
 func (i *ServiceAccountKeyIssuer) Activate(keyID string) error {
-	return errNotImplemented
+	if i.legacy {
+		return errNotImplemented
+	}
+
+	keyID = strings.TrimSpace(keyID)
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	rec, ok := i.keys[keyID]
+	if !ok {
+		return ErrKeyNotFound
+	}
+	if rec.State == KeyDisabled {
+		return ErrKeyDisabled
+	}
+
+	i.expireIfDueLocked(rec)
+	if rec.State == KeyExpired {
+		return ErrKeyExpired
+	}
+	if rec.State == KeyPendingActivation && i.now().Before(rec.ActivateAt) {
+		return ErrTooEarly
+	}
+
+	rec.State = KeyActive
+	return nil
 }
 
 // Disable turns a key off with an operator reason.
 func (i *ServiceAccountKeyIssuer) Disable(keyID, reason string) error {
-	return errNotImplemented
+	if i.legacy {
+		return errNotImplemented
+	}
+	if isBlank(reason) {
+		return ErrBadReason
+	}
+
+	keyID = strings.TrimSpace(keyID)
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	rec, ok := i.keys[keyID]
+	if !ok {
+		return ErrKeyNotFound
+	}
+	rec.State = KeyDisabled
+	rec.DisableReason = strings.TrimSpace(reason)
+	return nil
 }
 
 // List returns the key metadata of one account, oldest first.
 func (i *ServiceAccountKeyIssuer) List(accountID string) []KeyMeta {
-	return nil
+	if i.legacy {
+		return nil
+	}
+
+	accountID = strings.TrimSpace(accountID)
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	metas := make([]KeyMeta, 0)
+	for _, rec := range i.keys {
+		if rec.AccountID != accountID {
+			continue
+		}
+		i.expireIfDueLocked(rec)
+		metas = append(metas, toKeyMeta(rec))
+	}
+	sort.Slice(metas, func(left, right int) bool {
+		return metas[left].Seq < metas[right].Seq
+	})
+	return metas
 }
 
 // Get reads one request record.
 func (i *ServiceAccountKeyIssuer) Get(requestID string) (Request, bool) {
-	return Request{}, false
+	if i.legacy {
+		return Request{}, false
+	}
+
+	requestID = strings.TrimSpace(requestID)
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	req, ok := i.requests[requestID]
+	if !ok {
+		return Request{}, false
+	}
+	return cloneRequest(req), true
 }
 
 // LookupKey reads one key metadata record.
 func (i *ServiceAccountKeyIssuer) LookupKey(keyID string) (KeyMeta, bool) {
-	return KeyMeta{}, false
+	if i.legacy {
+		return KeyMeta{}, false
+	}
+
+	keyID = strings.TrimSpace(keyID)
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	rec, ok := i.keys[keyID]
+	if !ok {
+		return KeyMeta{}, false
+	}
+	i.expireIfDueLocked(rec)
+	return toKeyMeta(rec), true
+}
+
+const snapshotVersion = 1
+
+type snapshotEnvelope struct {
+	Version  int             `json:"version"`
+	Checksum string          `json:"checksum"`
+	Payload  json.RawMessage `json:"payload"`
+}
+
+type snapshotPayload struct {
+	ReqSeq   int64       `json:"req_seq"`
+	KeySeq   int64       `json:"key_seq"`
+	Requests []Request   `json:"requests"`
+	Keys     []keyRecord `json:"keys"`
+}
+
+type restoredState struct {
+	requests          map[string]*Request
+	keys              map[string]*keyRecord
+	pendingByAccount  map[string]int
+	keyCountByAccount map[string]int
+	reqSeq            int64
+	keySeq            int64
 }
 
 // Snapshot serialises requests, key metadata, schedules and the counters.
 func (i *ServiceAccountKeyIssuer) Snapshot() ([]byte, error) {
-	return nil, errNotImplemented
+	if i.legacy {
+		return nil, errNotImplemented
+	}
+
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	for _, rec := range i.keys {
+		i.expireIfDueLocked(rec)
+	}
+
+	payload := snapshotPayload{
+		ReqSeq:   i.reqSeq,
+		KeySeq:   i.keySeq,
+		Requests: make([]Request, 0, len(i.requests)),
+		Keys:     make([]keyRecord, 0, len(i.keys)),
+	}
+	for _, req := range i.requests {
+		payload.Requests = append(payload.Requests, cloneRequest(req))
+	}
+	sort.Slice(payload.Requests, func(left, right int) bool {
+		return payload.Requests[left].Seq < payload.Requests[right].Seq
+	})
+	for _, rec := range i.keys {
+		copied := *rec
+		copied.Scopes = cloneStrings(rec.Scopes)
+		payload.Keys = append(payload.Keys, copied)
+	}
+	sort.Slice(payload.Keys, func(left, right int) bool {
+		return payload.Keys[left].Seq < payload.Keys[right].Seq
+	})
+
+	rawPayload, err := json.Marshal(&payload)
+	if err != nil {
+		return nil, err
+	}
+	digest := sha256.Sum256(rawPayload)
+	envelope := snapshotEnvelope{
+		Version:  snapshotVersion,
+		Checksum: hex.EncodeToString(digest[:]),
+		Payload:  rawPayload,
+	}
+	return json.Marshal(&envelope)
 }
 
 // Restore replaces the whole state with a snapshot, all or nothing.
 func (i *ServiceAccountKeyIssuer) Restore(data []byte) error {
-	return errNotImplemented
+	if i.legacy {
+		return errNotImplemented
+	}
+
+	next, err := decodeSnapshot(data)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrBadSnapshot, err)
+	}
+
+	i.mu.Lock()
+	i.requests = next.requests
+	i.keys = next.keys
+	i.pendingByAccount = next.pendingByAccount
+	i.keyCountByAccount = next.keyCountByAccount
+	i.reqSeq = next.reqSeq
+	i.keySeq = next.keySeq
+	i.mu.Unlock()
+	return nil
+}
+
+func decodeSnapshot(data []byte) (*restoredState, error) {
+	if len(strings.TrimSpace(string(data))) == 0 {
+		return nil, errors.New("empty snapshot")
+	}
+
+	var envelope snapshotEnvelope
+	if err := json.Unmarshal(data, &envelope); err != nil {
+		return nil, err
+	}
+	if envelope.Version != snapshotVersion {
+		return nil, fmt.Errorf("unsupported snapshot version %d", envelope.Version)
+	}
+	if len(envelope.Checksum) != sha256.Size*2 {
+		return nil, errors.New("snapshot seal is missing")
+	}
+	digest := sha256.Sum256(envelope.Payload)
+	actualChecksum := hex.EncodeToString(digest[:])
+	if subtle.ConstantTimeCompare([]byte(actualChecksum), []byte(envelope.Checksum)) != 1 {
+		return nil, errors.New("snapshot checksum mismatch")
+	}
+
+	var payload snapshotPayload
+	if err := json.Unmarshal(envelope.Payload, &payload); err != nil {
+		return nil, err
+	}
+	if payload.ReqSeq < 0 || payload.KeySeq < 0 {
+		return nil, errors.New("negative counter")
+	}
+
+	state := &restoredState{
+		requests:          make(map[string]*Request, len(payload.Requests)),
+		keys:              make(map[string]*keyRecord, len(payload.Keys)),
+		pendingByAccount:  make(map[string]int),
+		keyCountByAccount: make(map[string]int),
+		reqSeq:            payload.ReqSeq,
+		keySeq:            payload.KeySeq,
+	}
+
+	for index := range payload.Requests {
+		req := payload.Requests[index]
+		req.ID = strings.TrimSpace(req.ID)
+		req.AccountID = strings.TrimSpace(req.AccountID)
+		req.RequesterID = strings.TrimSpace(req.RequesterID)
+		if req.ID == "" || req.AccountID == "" || req.RequesterID == "" {
+			return nil, errors.New("request is missing an identity")
+		}
+		if _, duplicated := state.requests[req.ID]; duplicated {
+			return nil, fmt.Errorf("duplicate request id %q", req.ID)
+		}
+		if !validRequestState(req.State) {
+			return nil, fmt.Errorf("invalid request state %q", req.State)
+		}
+		if req.Seq <= 0 {
+			return nil, fmt.Errorf("invalid request sequence for %q", req.ID)
+		}
+		if req.Required < 0 {
+			return nil, fmt.Errorf("invalid required approval count for %q", req.ID)
+		}
+		req.Required = requiredVotes(&req, 1)
+		if req.Spec.TTL <= 0 || isBlank(req.Spec.Name) || len(req.Spec.Scopes) == 0 {
+			return nil, fmt.Errorf("invalid request spec for %q", req.ID)
+		}
+		for _, scope := range req.Spec.Scopes {
+			if isBlank(scope) {
+				return nil, fmt.Errorf("blank scope for %q", req.ID)
+			}
+		}
+
+		approvals := make(map[string]struct{}, len(req.Approvals))
+		for _, approver := range req.Approvals {
+			approver = strings.TrimSpace(approver)
+			if approver == "" {
+				return nil, fmt.Errorf("blank approval identity for %q", req.ID)
+			}
+			if approver == req.RequesterID {
+				return nil, fmt.Errorf("self approval for %q", req.ID)
+			}
+			if _, duplicated := approvals[approver]; duplicated {
+				return nil, fmt.Errorf("duplicate approval for %q", req.ID)
+			}
+			approvals[approver] = struct{}{}
+		}
+		req.Approvals = cloneStrings(req.Approvals)
+		if req.State == RequestPending && len(req.Approvals) >= req.Required {
+			return nil, fmt.Errorf("pending request %q already meets quorum", req.ID)
+		}
+		if (req.State == RequestApproved || req.State == RequestIssued) && len(req.Approvals) < req.Required {
+			return nil, fmt.Errorf("approved request %q lacks quorum", req.ID)
+		}
+
+		req.Spec.Name = strings.TrimSpace(req.Spec.Name)
+		req.Spec.Scopes = cloneStrings(req.Spec.Scopes)
+		state.requests[req.ID] = &req
+		if req.State == RequestPending {
+			state.pendingByAccount[req.AccountID]++
+		}
+		if req.Seq > state.reqSeq {
+			state.reqSeq = req.Seq
+		}
+	}
+
+	issuedRequestKeys := make(map[string]string)
+	for index := range payload.Keys {
+		rec := payload.Keys[index]
+		rec.KeyID = strings.TrimSpace(rec.KeyID)
+		rec.RequestID = strings.TrimSpace(rec.RequestID)
+		rec.AccountID = strings.TrimSpace(rec.AccountID)
+		if rec.KeyID == "" || rec.RequestID == "" || rec.AccountID == "" {
+			return nil, errors.New("key is missing an identity")
+		}
+		if _, duplicated := state.keys[rec.KeyID]; duplicated {
+			return nil, fmt.Errorf("duplicate key id %q", rec.KeyID)
+		}
+		if !validKeyState(rec.State) {
+			return nil, fmt.Errorf("invalid key state %q", rec.State)
+		}
+		if rec.Seq <= 0 {
+			return nil, fmt.Errorf("invalid key sequence for %q", rec.KeyID)
+		}
+		if len(rec.Prefix) != 8 {
+			return nil, fmt.Errorf("invalid key prefix for %q", rec.KeyID)
+		}
+		if len(rec.Scopes) == 0 {
+			return nil, fmt.Errorf("missing key scopes for %q", rec.KeyID)
+		}
+		if !rec.ExpiresAt.After(rec.IssuedAt) {
+			return nil, fmt.Errorf("invalid key schedule for %q", rec.KeyID)
+		}
+		req, ok := state.requests[rec.RequestID]
+		if !ok {
+			return nil, fmt.Errorf("key %q references missing request", rec.KeyID)
+		}
+		if req.State != RequestIssued {
+			return nil, fmt.Errorf("key %q references unissued request", rec.KeyID)
+		}
+		if req.AccountID != rec.AccountID {
+			return nil, fmt.Errorf("key %q account does not match request", rec.KeyID)
+		}
+		if previousKey, duplicated := issuedRequestKeys[rec.RequestID]; duplicated {
+			return nil, fmt.Errorf("request %q issued keys %q and %q", rec.RequestID, previousKey, rec.KeyID)
+		}
+		issuedRequestKeys[rec.RequestID] = rec.KeyID
+
+		rec.Scopes = cloneStrings(rec.Scopes)
+		state.keys[rec.KeyID] = &rec
+		state.keyCountByAccount[rec.AccountID]++
+		if rec.Seq > state.keySeq {
+			state.keySeq = rec.Seq
+		}
+	}
+
+	return state, nil
+}
+
+func validRequestState(state string) bool {
+	switch state {
+	case RequestPending, RequestApproved, RequestRejected, RequestIssued:
+		return true
+	default:
+		return false
+	}
+}
+
+func validKeyState(state string) bool {
+	switch state {
+	case KeyPendingActivation, KeyActive, KeyDisabled, KeyExpired:
+		return true
+	default:
+		return false
+	}
 }
